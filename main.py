@@ -7,7 +7,7 @@ import aio_pika
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import PyMongoError
 
-# Configuración de Logs profesional
+# Logs format setup  
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -15,7 +15,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Cargar variables de entorno
+# Load env variables 
 load_dotenv()
 
 RABBITMQ_URL = os.getenv("RABBITMQ_URL")
@@ -27,66 +27,64 @@ QUEUE_NAME = os.getenv("QUEUE_NAME")
 
 async def process_and_save(message: aio_pika.IncomingMessage, collection) -> None:
     """
-    Gestiona la lógica interna de decodificación e inserción en MongoDB.
+    Manage decode logic and mongo insert 
     """
-    # 1. Intentar decodificar el mensaje JSON
+    # Tries to decode json 
     try:
         cuerpo = message.body.decode()
         logger.info(f"Mensaje recibido: {cuerpo}")
         datos = json.loads(cuerpo)
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         logger.error(f"Mensaje mal formado. No es un JSON válido. Error: {e}")
-        # Rechazamos el mensaje sin reenviarlo a la cola (requeue=False) para que no cause un bucle infinito
+        # Message rejected w/o sending it to queue(requeue=False) avoiding infinite loops
         await message.reject(requeue=False)
         return
 
-    # 2. Intentar guardar en MongoDB
+    # Tries saving in mongo
     try:
-        # Insertamos el documento de forma asíncrona
+        # Insert doc async
         await collection.insert_one(datos)
         logger.info(f"Mensaje guardado exitosamente en Mongo. ID: {datos.get('id', 'N/A')}")
         
-        # Confirmamos a RabbitMQ que el mensaje fue procesado con éxito (ACK)
+        # Confirm to rabbit message processed(ack)
         await message.ack()
 
     except PyMongoError as e:
         logger.error(f"Error de base de datos al guardar en Mongo: {e}")
         # Si la BD falla temporalmente, devolvemos el mensaje a la cola (requeue=True) 
-        # para que se intente procesar más tarde o lo tome otra instancia
+        # so it could be processed later or by another instance
         await message.nack(requeue=True)
-        # Esperamos un momento para no saturar si la base de datos se cayó por completo
+        # Wait a bit, avoiding saturation if DB failed completely
         await asyncio.sleep(2)
 
 
 async def main():
     logger.info("Iniciando el microservicio...")
 
-    # Conexión asíncrona a MongoDB
+    # Async connection to mongo
     mongo_client = AsyncIOMotorClient(MONGODB_URL)
     db = mongo_client[MONGO_DB_NAME]
     collection = db[MONGO_COLLECTION]
     logger.info("Conectado exitosamente a MongoDB.")
 
-    # Conexión robusta a RabbitMQ (se reconecta automáticamente si se cae la red)
+    # HiFi connection to rabbit(reconnects automatically if connection fails)
     connection = await aio_pika.connect_robust(RABBITMQ_URL)
     
     async with connection:
         channel = await connection.channel()
         
-        # Prefetch_count=10 significa que este microservicio tomará un máximo de 10 mensajes
-        # a la vez en memoria. No pedirá más hasta que haga ACK/NACK de alguno.
+        # Prefetch_count=10 this service will take 10 messages at max
         await channel.set_qos(prefetch_count=10)
         
-        # Declaramos la cola asegurando que sea persistente (durable=True)
+        # Queue is persistent(durable=True)
         queue = await channel.declare_queue(QUEUE_NAME, durable=True)
 
         logger.info(f"Escuchando la cola: '{QUEUE_NAME}'. Para salir presiona CTRL+C")
 
-        # Bucle infinito para consumir los mensajes
+        # Infinite loop to consume messages
         async with queue.iterator() as queue_iter:
             async for message in queue_iter:
-                # Enviamos el procesamiento a una tarea asíncrona dedicada
-                # Esto permite procesar el mensaje 'B' mientras el mensaje 'A' se escribe en Mongo
+                # Processing is done in a sepparate thread
                 asyncio.create_task(process_and_save(message, collection))
 
 
